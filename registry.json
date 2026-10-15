@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "cpa-devin",
+      "name": "Devin 动态模型目录",
+      "description": "按 Devin 凭证读取账号实际可用模型，并保留 CLIProxyAPI 原生 Devin 执行器。",
+      "author": "junxin367",
+      "version": "0.1.0",
+      "repository": "https://github.com/junxin367/cpa-devin",
+      "homepage": "https://github.com/junxin367/cpa-devin",
+      "license": "MIT",
+      "tags": [
+        "Model",
+        "Devin",
+        "OAuth"
+      ]
+    }
+  ]
+}

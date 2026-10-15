@@ -1,0 +1,156 @@
+name: 构建与发布
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CPA_PLUGIN_REPOSITORY: ${{ github.server_url }}/${{ github.repository }}
+
+jobs:
+  metadata:
+    name: 检查版本与提交
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 校验标签与 Cargo 版本
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/release.mjs metadata
+
+  check:
+    name: 源码检查
+    needs: metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          persist-credentials: false
+      - name: 安装固定 Rust 工具链
+        run: rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Rust 格式
+        run: cargo fmt --all -- --check
+      - name: JavaScript 与注册表
+        run: |
+          node --check scripts/release.mjs
+          node scripts/release.mjs registry
+      - name: 编译与测试
+        run: cargo test --locked
+
+  build:
+    name: 构建 ${{ matrix.platform }}
+    needs: [metadata, check]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+          - platform: linux-amd64
+            runner: ubuntu-22.04
+            goos: linux
+            goarch: amd64
+          - platform: darwin-amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - platform: darwin-arm64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          persist-credentials: false
+      - name: 安装固定 Rust 工具链
+        run: rustup show active-toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.runner }}-${{ matrix.platform }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: 构建与打包
+        shell: pwsh
+        run: ./scripts/build.ps1 -ReleaseAssets
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cpa-devin-${{ matrix.platform }}
+          path: dist/cpa-devin_${{ needs.metadata.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: 发布全部平台产物
+    needs: [metadata, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cpa-devin-*
+          path: artifacts
+          merge-multiple: true
+      - name: 校验产物并生成发布说明
+        run: |
+          mkdir -p temp
+          node scripts/release.mjs checksums artifacts "$VERSION"
+          node scripts/release.mjs notes "$RELEASE_TAG" "$GH_REPO" > temp/release-notes.md
+      - name: 创建或补全 GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
+          else
+            flags=()
+            if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$RELEASE_TAG" artifacts/* --verify-tag \
+              --title "$RELEASE_TAG" --notes-file temp/release-notes.md "${flags[@]}"
+          fi
+      - name: 生成并上传 latest.json
+        run: |
+          gh release view "$RELEASE_TAG" --json assets,body,tagName,url > temp/release.json
+          node scripts/release.mjs manifest temp/release.json artifacts/latest.json
+          gh release upload "$RELEASE_TAG" artifacts/latest.json --clobber
