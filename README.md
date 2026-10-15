@@ -9,8 +9,9 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 ## 行为
 
 - `model.for_auth` 按 Devin 凭证读取账号专属模型目录。
-- 上游返回的精确 effort UID 会在宿主内部注册，保证鉴权选择和请求路由能命中对应凭证；插件会过滤 `/v1/models` 响应中的 effort 变体，客户端模型目录只展示聚合后的基础模型，例如 `devin/claude-sonnet-5-5`。
-- `model.route` 将插件发布的模型名解析为该账号目录中的真实 `chat_model_uid`，再交给 CLIProxyAPI 原生 `devin` executor 执行。
+- 凭证只注册聚合后的基础模型，例如 `devin/claude-sonnet-5-5`；`-low`、`-high`、`-thinking`、`-thinking-1m`、`-fast` 等上游内部 UID 不再进入凭证模型列表。
+- `model.route` 根据该凭证实际支持的等级，将请求转换成 `基础模型(推理等级)`，再交给 CLIProxyAPI 原生 `devin` executor 解析为真实 `chat_model_uid`。鉴权始终使用基础模型，不需要注册精确 effort UID。
+- `response_interceptor` 会从 `/v1/models` 中过滤仍由其他来源发布的内部 UID，避免客户端模型目录重复展示变体。
 - 使用 `api_key`、`session_token` 或 `token`，兼容 `base_url`、`device_seed`、`proxy_url` 和 `header:*` 自定义请求头。
 - 账号设置了 `proxy_url` 时使用该代理直接请求；未设置时通过 CLIProxyAPI 的 `host.http.do` 执行。
 - 同一基础模型的 `none`、`low`、`medium`、`high`、`xhigh`、`max` 等变体会合并为 `Thinking.Levels`。
@@ -23,9 +24,9 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 
 插件会在宿主加载插件、加载或更新 Devin 凭证等触发按凭证模型注册的时机重新读取上游目录。CLIProxyAPI 当前没有向独立模型插件暴露“主动要求宿主重新发布某个凭证模型”的回调；上游目录在凭证不变期间发生变化时，需要重载插件、更新凭证或重启宿主来触发重新注册。
 
-CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 内置静态目录，不读取插件按凭证发布的动态模型；宿主也不会让响应拦截器处理该管理接口，因此插件无法把动态模型注入这个下拉。动态模型不需要配置 OAuth 别名，直接使用 `/v1/models` 返回的基础模型名发起请求即可，插件会按照请求中的推理等级映射到真实上游 UID。
+基础模型路由依赖 CLIProxyAPI 的 Devin 模型目录。仓库中的 [`models/devin_models.json`](models/devin_models.json) 在宿主官方目录基础上补充插件已支持的新模型；必须按下方安装步骤配置 `models.devin-catalog`，否则宿主无法为官方目录尚未收录的新模型解析推理等级。
 
-管理页“凭证支持的模型”接口直接展示宿主内部注册项，仍可能看到用于鉴权选择的精确 effort UID；客户端 `/v1/models` 目录不会展示这些内部变体。
+本插件不修改或注入 OAuth 模型别名。
 
 ## 安装
 
@@ -40,9 +41,12 @@ CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 
    | Linux | `cpa-devin.so` |
    | macOS | `cpa-devin.dylib` |
 
-3. 在 CLIProxyAPI 配置中启用全局插件加载和本插件：
+3. 在 CLIProxyAPI 配置顶层指定本插件维护的 Devin 模型目录，并启用全局插件加载和本插件：
 
    ```yaml
+   models:
+     devin-catalog: "https://raw.githubusercontent.com/junxin367/cpa-devin/main/models/devin_models.json"
+
    plugins:
      enabled: true
      dir: "plugins"
@@ -53,9 +57,9 @@ CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 
 
 4. 重启 CLIProxyAPI。
 5. 检查日志中插件加载成功，且 Devin 凭证没有出现 `cpa-devin 上游模型目录读取失败` 警告。
-6. 请求 `/v1/models`，确认对应 Devin 凭证发布的模型与该账号上游目录一致。
+6. 打开凭证模型列表或请求 `/v1/models`，确认只展示基础模型；使用请求体中的 `reasoning_effort`、`reasoning.effort`、`reasoning.level` 或 `thinking.level` 选择推理等级。
 
-插件不需要额外 YAML 配置，也不会保存或修改 Devin 凭证。
+`models.devin-catalog` 支持配置热加载；保存配置后仍建议重载插件或重启宿主，使已有 Devin 凭证立即重新注册为基础模型。插件不会保存或修改 Devin 凭证。
 
 ## 从源码构建
 
@@ -83,7 +87,7 @@ Windows 原始产物位于 `target/release/cpa_devin.dll`，安装时需要重�
 src/lib.rs                 C ABI、插件注册与 RPC 分发
 src/host.rs                CLIProxyAPI 宿主回调桥接
 src/devin.rs               凭证解析、上游请求、protobuf 与模型聚合
-models/devin_models.json   上游失败时使用的内置目录
+models/devin_models.json   宿主 Devin 目录源与插件内置回退目录
 scripts/build.ps1          构建、打包与校验
 scripts/release.mjs        版本校验、发布说明、校验清单与 latest.json
 registry.json              CPA 插件注册表

@@ -607,79 +607,7 @@ fn build_models_from_upstream(raw: &[UpstreamModel]) -> Vec<ModelInfo> {
         }
         model.output_token_limit = model.max_completion_tokens;
     }
-    upsert_builtin(&mut models);
-    append_exact_models(&mut models, raw);
     models
-}
-
-fn append_exact_models(models: &mut Vec<ModelInfo>, raw: &[UpstreamModel]) {
-    let mut seen = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<HashSet<_>>();
-    let mut seen_upstream = HashSet::new();
-    for raw_model in raw {
-        let uid = raw_model.uid.trim();
-        if uid.is_empty() || !seen_upstream.insert(uid.to_lowercase()) {
-            continue;
-        }
-        let id = format!("devin/{uid}");
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let mut input_modalities = vec!["text".to_string()];
-        if raw_model.multimodal {
-            input_modalities.push("image".to_string());
-        }
-        let mut model = ModelInfo {
-            id,
-            object: "model".to_string(),
-            owned_by: vendor_name(raw_model.vendor_id, uid).to_string(),
-            model_type: "devin".to_string(),
-            display_name: raw_model.label.trim().to_string(),
-            input_token_limit: raw_model.context_length,
-            output_token_limit: DEFAULT_COMPLETION_TOKENS,
-            supported_generation_methods: vec![
-                "generateContent".to_string(),
-                "countTokens".to_string(),
-            ],
-            context_length: raw_model.context_length,
-            max_completion_tokens: DEFAULT_COMPLETION_TOKENS,
-            supported_input_modalities: input_modalities,
-            supported_output_modalities: vec!["text".to_string()],
-            thinking: None,
-        };
-        normalize_exact_model(&mut model);
-        models.push(model);
-    }
-}
-
-fn normalize_exact_model(model: &mut ModelInfo) {
-    if !model.id.to_lowercase().starts_with("devin/") {
-        model.id = format!("devin/{}", model.id);
-    }
-    if model.object.is_empty() {
-        model.object = "model".to_string();
-    }
-    if model.model_type.is_empty() {
-        model.model_type = "devin".to_string();
-    }
-    if model.supported_input_modalities.is_empty() {
-        model.supported_input_modalities = vec!["text".to_string()];
-    }
-    if model.supported_output_modalities.is_empty() {
-        model.supported_output_modalities = vec!["text".to_string()];
-    }
-    if model.input_token_limit == 0 && model.context_length > 0 {
-        model.input_token_limit = model.context_length;
-    }
-    if model.output_token_limit == 0 && model.max_completion_tokens > 0 {
-        model.output_token_limit = model.max_completion_tokens;
-    }
-    if model.supported_generation_methods.is_empty() {
-        model.supported_generation_methods =
-            vec!["generateContent".to_string(), "countTokens".to_string()];
-    }
 }
 
 fn build_route_catalog(raw: &[UpstreamModel]) -> RouteCatalog {
@@ -694,7 +622,7 @@ fn build_route_catalog(raw: &[UpstreamModel]) -> RouteCatalog {
         if base_id.is_empty() {
             base_id = clean_uid.clone();
         }
-        let target_model = format!("devin/{uid}");
+        let target_model = routed_model(&base_id, &effort);
         catalog
             .exact
             .entry(clean_uid.clone())
@@ -713,6 +641,14 @@ fn build_route_catalog(raw: &[UpstreamModel]) -> RouteCatalog {
         });
     }
     catalog
+}
+
+fn routed_model(base_id: &str, effort: &str) -> String {
+    if effort.is_empty() {
+        format!("devin/{base_id}")
+    } else {
+        format!("devin/{base_id}({effort})")
+    }
 }
 
 fn routes() -> &'static RwLock<HashMap<String, RouteCatalog>> {
@@ -756,9 +692,8 @@ fn hidden_route_models() -> HashSet<String> {
         .values()
         .flat_map(|catalog| catalog.exact.keys())
         .filter_map(|uid| {
-            let (base_id, effort) = split_model_id(uid);
-            (!effort.is_empty() && !base_id.eq_ignore_ascii_case(uid))
-                .then(|| format!("devin/{uid}").to_lowercase())
+            let (base_id, _) = split_model_id(uid);
+            (!base_id.eq_ignore_ascii_case(uid)).then(|| format!("devin/{uid}").to_lowercase())
         })
         .collect()
 }
@@ -1196,7 +1131,7 @@ fn split_model_id(clean_id: &str) -> (String, String) {
         return (clean_id.to_string(), String::new());
     }
     if clean_id == "swe-1-6-fast" {
-        return ("swe-1-6".to_string(), String::new());
+        return ("swe-1-6".to_string(), "fast".to_string());
     }
 
     let upper = clean_id.to_uppercase();
@@ -1231,10 +1166,11 @@ fn split_model_id(clean_id: &str) -> (String, String) {
         ("-xhigh-priority", "xhigh", ""),
         ("-max-priority", "max", ""),
         ("-none-priority", "none", ""),
-        ("-thinking-1m", "", "-1m"),
-        ("-thinking", "", ""),
-        ("-max-1m", "max", "-1m"),
-        ("-none-1m", "none", "-1m"),
+        ("-thinking-1m", "high", ""),
+        ("-thinking", "high", ""),
+        ("-max-1m", "max", ""),
+        ("-none-1m", "none", ""),
+        ("-fast", "fast", ""),
     ] {
         if clean_id.ends_with(suffix) {
             let mut base = clean_id[..clean_id.len() - suffix.len()].to_string();
@@ -1257,6 +1193,11 @@ fn split_model_id(clean_id: &str) -> (String, String) {
                 clean_id[..clean_id.len() - suffix.len()].to_string(),
                 effort.to_string(),
             );
+        }
+    }
+    for base in ["claude-opus-4-6", "claude-sonnet-4-6", "glm-5-2"] {
+        if clean_id == format!("{base}-1m") {
+            return (base.to_string(), String::new());
         }
     }
     (clean_id.to_string(), String::new())
@@ -1364,7 +1305,6 @@ fn catalog() -> &'static Catalog {
             Err(_) => Vec::new(),
         };
         models = aggregate_models(models);
-        upsert_builtin(&mut models);
         let by_id = models
             .iter()
             .cloned()
@@ -1394,36 +1334,6 @@ fn catalog_model(model: CatalogModel) -> ModelInfo {
     };
     normalize_model(&mut result);
     result
-}
-
-fn builtin_model() -> ModelInfo {
-    ModelInfo {
-        id: "devin/swe-1-6-slow".to_string(),
-        object: "model".to_string(),
-        owned_by: "cognition".to_string(),
-        model_type: "devin".to_string(),
-        display_name: "SWE-1.6 Slow".to_string(),
-        input_token_limit: 200_000,
-        output_token_limit: 64_000,
-        supported_generation_methods: vec![
-            "generateContent".to_string(),
-            "countTokens".to_string(),
-        ],
-        context_length: 200_000,
-        max_completion_tokens: 64_000,
-        supported_input_modalities: vec!["text".to_string(), "image".to_string()],
-        supported_output_modalities: vec!["text".to_string()],
-        thinking: None,
-    }
-}
-
-fn upsert_builtin(models: &mut Vec<ModelInfo>) {
-    let builtin = builtin_model();
-    if let Some(existing) = models.iter_mut().find(|model| model.id == builtin.id) {
-        *existing = builtin;
-    } else {
-        models.push(builtin);
-    }
 }
 
 fn extend_unique(target: &mut Vec<String>, values: &[String]) {
@@ -1513,4 +1423,80 @@ fn lookup_string(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
 
 fn normalize_key(value: &str) -> String {
     value.trim().to_lowercase().replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream(uid: &str) -> UpstreamModel {
+        UpstreamModel {
+            uid: uid.to_string(),
+            label: uid.to_string(),
+            context_length: 1_000_000,
+            multimodal: true,
+            vendor_id: 3,
+        }
+    }
+
+    #[test]
+    fn discovered_models_only_publish_canonical_names() {
+        let raw = vec![
+            upstream("claude-sonnet-5-5-low"),
+            upstream("claude-sonnet-5-5-high"),
+            upstream("claude-sonnet-4-6-thinking"),
+            upstream("claude-sonnet-4-6-thinking-1m"),
+            upstream("swe-1-6-fast"),
+        ];
+
+        let models = build_models_from_upstream(&raw);
+        let ids = models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(ids.contains("devin/claude-sonnet-5-5"));
+        assert!(ids.contains("devin/claude-sonnet-4-6"));
+        assert!(ids.contains("devin/swe-1-6"));
+        assert!(!ids.iter().any(|id| {
+            id.ends_with("-low")
+                || id.ends_with("-high")
+                || id.contains("-thinking")
+                || id.ends_with("-fast")
+                || id.ends_with("-slow")
+        }));
+    }
+
+    #[test]
+    fn routes_use_auth_safe_base_model_suffixes() {
+        let raw = vec![
+            upstream("claude-sonnet-5-5-low"),
+            upstream("claude-sonnet-5-5-high"),
+            upstream("claude-sonnet-4-6-thinking"),
+            upstream("claude-sonnet-4-6-thinking-1m"),
+            upstream("swe-1-6-fast"),
+        ];
+        let routes = build_route_catalog(&raw);
+
+        assert_eq!(
+            select_route(std::iter::once(&routes), "devin/claude-sonnet-5-5", "high"),
+            Some("devin/claude-sonnet-5-5(high)".to_string())
+        );
+        assert_eq!(
+            select_route(std::iter::once(&routes), "devin/claude-sonnet-5-5-low", ""),
+            Some("devin/claude-sonnet-5-5(low)".to_string())
+        );
+        assert_eq!(
+            select_route(
+                std::iter::once(&routes),
+                "devin/claude-sonnet-4-6-thinking-1m",
+                ""
+            ),
+            Some("devin/claude-sonnet-4-6(high)".to_string())
+        );
+        assert_eq!(
+            select_route(std::iter::once(&routes), "devin/swe-1-6", "fast"),
+            Some("devin/swe-1-6(fast)".to_string())
+        );
+    }
 }
