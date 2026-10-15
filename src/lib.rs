@@ -137,6 +137,7 @@ fn dispatch(method: &str, request: &Value) -> Value {
         "model.static" => ok(json!({"Provider": "devin", "Models": []})),
         "model.for_auth" => ok(devin::models_for_auth(request)),
         "model.route" => ok(devin::route_model(request)),
+        "response.intercept_after" => ok(devin::intercept_response(request)),
         _ => error_envelope("unknown_method", format!("不支持的宿主调用方法：{method}")),
     }
 }
@@ -155,6 +156,7 @@ fn registration() -> Value {
         "capabilities": {
             "model_provider": true,
             "model_router": true,
+            "response_interceptor": true,
             "executor": true,
             "executor_model_scope": "oauth",
             "executor_input_formats": ["openai"],

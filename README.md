@@ -9,7 +9,7 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 ## 行为
 
 - `model.for_auth` 按 Devin 凭证读取账号专属模型目录。
-- 上游返回的每个精确 UID 都会额外注册为 `devin/<uid>`，例如账号返回 `claude-sonnet-5-5` 时会发布 `devin/claude-sonnet-5-5`。
+- 上游返回的精确 effort UID 会在宿主内部注册，保证鉴权选择和请求路由能命中对应凭证；插件会过滤 `/v1/models` 响应中的 effort 变体，客户端模型目录只展示聚合后的基础模型，例如 `devin/claude-sonnet-5-5`。
 - `model.route` 将插件发布的模型名解析为该账号目录中的真实 `chat_model_uid`，再交给 CLIProxyAPI 原生 `devin` executor 执行。
 - 使用 `api_key`、`session_token` 或 `token`，兼容 `base_url`、`device_seed`、`proxy_url` 和 `header:*` 自定义请求头。
 - 账号设置了 `proxy_url` 时使用该代理直接请求；未设置时通过 CLIProxyAPI 的 `host.http.do` 执行。
@@ -19,11 +19,13 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 
 ## 兼容性
 
-已按 `CLIProxyAPI v8.0.29` 的插件 ABI 实现和验证。该版本包含 `model_provider`、`model.for_auth`、`model_router`、`model.route` 与 `executor_model_scope: oauth`。
+已按 `CLIProxyAPI v8.0.29` 的插件 ABI 实现和验证。该版本包含 `model_provider`、`model.for_auth`、`model_router`、`model.route`、`response_interceptor` 与 `executor_model_scope: oauth`。
 
 插件会在宿主加载插件、加载或更新 Devin 凭证等触发按凭证模型注册的时机重新读取上游目录。CLIProxyAPI 当前没有向独立模型插件暴露“主动要求宿主重新发布某个凭证模型”的回调；上游目录在凭证不变期间发生变化时，需要重载插件、更新凭证或重启宿主来触发重新注册。
 
-CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 内置静态目录，不读取插件按凭证发布的动态模型，因此动态模型不一定出现在该下拉中。这个界面限制不影响直接使用 `/v1/models` 返回的 `devin/<uid>` 发起请求。
+CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 内置静态目录，不读取插件按凭证发布的动态模型；宿主也不会让响应拦截器处理该管理接口，因此插件无法把动态模型注入这个下拉。动态模型不需要配置 OAuth 别名，直接使用 `/v1/models` 返回的基础模型名发起请求即可，插件会按照请求中的推理等级映射到真实上游 UID。
+
+管理页“凭证支持的模型”接口直接展示宿主内部注册项，仍可能看到用于鉴权选择的精确 effort UID；客户端 `/v1/models` 目录不会展示这些内部变体。
 
 ## 安装
 

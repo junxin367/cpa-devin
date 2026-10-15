@@ -182,6 +182,29 @@ pub fn route_model(request: &Value) -> Value {
     })
 }
 
+pub fn intercept_response(request: &Value) -> Value {
+    if string_field(request, &["Model", "model"]).is_some_and(|value| !value.is_empty())
+        || string_field(request, &["RequestedModel", "requested_model"])
+            .is_some_and(|value| !value.is_empty())
+    {
+        return json!({});
+    }
+    let hidden_models = hidden_route_models();
+    if hidden_models.is_empty() {
+        return json!({});
+    }
+    let Some(body) = bytes_field(request, &["Body", "body"]) else {
+        return json!({});
+    };
+    let Some(filtered) = filter_model_catalog_response(&body, &hidden_models) else {
+        return json!({});
+    };
+    json!({
+        "Body": STANDARD.encode(filtered),
+        "ClearHeaders": ["Content-Length"]
+    })
+}
+
 pub fn clear_routes() {
     if let Some(routes) = ROUTES.get() {
         if let Ok(mut routes) = routes.write() {
@@ -720,6 +743,67 @@ fn clear_auth_routes(auth_id: &str) {
             routes.remove(auth_id);
         }
     }
+}
+
+fn hidden_route_models() -> HashSet<String> {
+    let Some(routes) = ROUTES.get() else {
+        return HashSet::new();
+    };
+    let Ok(routes) = routes.read() else {
+        return HashSet::new();
+    };
+    routes
+        .values()
+        .flat_map(|catalog| catalog.exact.keys())
+        .filter_map(|uid| {
+            let (base_id, effort) = split_model_id(uid);
+            (!effort.is_empty() && !base_id.eq_ignore_ascii_case(uid))
+                .then(|| format!("devin/{uid}").to_lowercase())
+        })
+        .collect()
+}
+
+fn filter_model_catalog_response(body: &[u8], hidden_models: &HashSet<String>) -> Option<Vec<u8>> {
+    let mut payload = serde_json::from_slice::<Value>(body).ok()?;
+    let root_is_list = payload
+        .get("object")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("list"));
+    let mut changed = false;
+
+    if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
+        let is_model_catalog = root_is_list || data.iter().any(is_model_catalog_entry);
+        if is_model_catalog {
+            changed |= remove_hidden_models(data, hidden_models);
+        }
+    }
+    if let Some(models) = payload.get_mut("models").and_then(Value::as_array_mut) {
+        changed |= remove_hidden_models(models, hidden_models);
+    }
+
+    changed.then(|| serde_json::to_vec(&payload).ok()).flatten()
+}
+
+fn remove_hidden_models(models: &mut Vec<Value>, hidden_models: &HashSet<String>) -> bool {
+    let original_len = models.len();
+    models.retain(|model| {
+        model_catalog_entry_id(model).is_none_or(|id| !hidden_models.contains(&id))
+    });
+    models.len() != original_len
+}
+
+fn is_model_catalog_entry(value: &Value) -> bool {
+    string_field(value, &["object", "type"])
+        .is_some_and(|value| value.eq_ignore_ascii_case("model"))
+        || string_field(value, &["name"])
+            .is_some_and(|value| value.to_lowercase().starts_with("models/"))
+}
+
+fn model_catalog_entry_id(value: &Value) -> Option<String> {
+    let id = string_field(value, &["id", "slug", "name"])?;
+    let lower = id.trim().to_lowercase();
+    let normalized = lower.strip_prefix("models/").unwrap_or(&lower).to_string();
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn resolve_route(requested_model: &str, requested_effort: &str) -> Option<String> {

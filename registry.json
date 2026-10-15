@@ -4,9 +4,9 @@
     {
       "id": "cpa-devin",
       "name": "Devin 动态模型目录",
-      "description": "按 Devin 凭证读取账号实际可用模型，将请求映射到真实上游模型 UID，并保留 CLIProxyAPI 原生 Devin 执行器。",
+      "description": "按 Devin 凭证读取账号实际可用模型，将请求映射到真实上游模型 UID，并在客户端模型目录中合并推理等级变体。",
       "author": "junxin367",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "repository": "https://github.com/junxin367/cpa-devin",
       "homepage": "https://github.com/junxin367/cpa-devin",
       "license": "MIT",
