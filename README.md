@@ -1,6 +1,6 @@
 # CPA Devin 动态模型目录
 
-CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModelConfigs`，将上游返回的 effort 变体聚合为 CLIProxyAPI 模型与 thinking levels，避免账号实际可用模型与 CLIProxyAPI 内置 Devin 目录不一致。
+CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModelConfigs`，将上游返回的 effort 变体聚合为 CLIProxyAPI 模型与 thinking levels，并在请求时映射回真实上游 `chat_model_uid`，避免账号实际可用模型与 CLIProxyAPI 内置 Devin 目录不一致。
 
 实现参考 [CLIProxyAPI PR #6529](https://github.com/router-for-me/CLIProxyAPI/pull/6529)，但通过插件扩展点完成，不替换 CLIProxyAPI 原生 Devin 请求执行器。
 
@@ -9,6 +9,8 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 ## 行为
 
 - `model.for_auth` 按 Devin 凭证读取账号专属模型目录。
+- 上游返回的每个精确 UID 都会额外注册为 `devin/<uid>`，例如账号返回 `claude-sonnet-5-5` 时会发布 `devin/claude-sonnet-5-5`。
+- `model.route` 将插件发布的模型名解析为该账号目录中的真实 `chat_model_uid`，再交给 CLIProxyAPI 原生 `devin` executor 执行。
 - 使用 `api_key`、`session_token` 或 `token`，兼容 `base_url`、`device_seed`、`proxy_url` 和 `header:*` 自定义请求头。
 - 账号设置了 `proxy_url` 时使用该代理直接请求；未设置时通过 CLIProxyAPI 的 `host.http.do` 执行。
 - 同一基础模型的 `none`、`low`、`medium`、`high`、`xhigh`、`max` 等变体会合并为 `Thinking.Levels`。
@@ -17,9 +19,11 @@ CLIProxyAPI 原生插件。它使用每个 Devin 凭证调用上游 `GetCliModel
 
 ## 兼容性
 
-已按 `CLIProxyAPI v8.0.29` 的插件 ABI 实现和验证。该版本包含 `model_provider`、`model.for_auth` 与 `executor_model_scope: oauth`。
+已按 `CLIProxyAPI v8.0.29` 的插件 ABI 实现和验证。该版本包含 `model_provider`、`model.for_auth`、`model_router`、`model.route` 与 `executor_model_scope: oauth`。
 
 插件会在宿主加载插件、加载或更新 Devin 凭证等触发按凭证模型注册的时机重新读取上游目录。CLIProxyAPI 当前没有向独立模型插件暴露“主动要求宿主重新发布某个凭证模型”的回调；上游目录在凭证不变期间发生变化时，需要重载插件、更新凭证或重启宿主来触发重新注册。
+
+CPA 管理页“新增提供商模型别名”的模型下拉读取 CLIProxyAPI 内置静态目录，不读取插件按凭证发布的动态模型，因此动态模型不一定出现在该下拉中。这个界面限制不影响直接使用 `/v1/models` 返回的 `devin/<uid>` 发起请求。
 
 ## 安装
 

@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::Read,
-    sync::OnceLock,
+    sync::{OnceLock, RwLock},
     time::Duration,
 };
 
@@ -70,6 +70,24 @@ struct UpstreamModel {
     vendor_id: u64,
 }
 
+#[derive(Clone, Debug)]
+struct RouteVariant {
+    target_model: String,
+    effort: String,
+    bare: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RouteCatalog {
+    by_base: HashMap<String, Vec<RouteVariant>>,
+    exact: HashMap<String, String>,
+}
+
+struct DiscoveredModels {
+    models: Vec<ModelInfo>,
+    routes: RouteCatalog,
+}
+
 #[derive(Default)]
 struct Credentials {
     api_key: String,
@@ -119,19 +137,25 @@ struct CatalogThinking {
 }
 
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
+static ROUTES: OnceLock<RwLock<HashMap<String, RouteCatalog>>> = OnceLock::new();
 
 pub fn models_for_auth(request: &Value) -> Value {
     let auth_id = string_field(request, &["AuthID", "auth_id"]).unwrap_or_default();
     let callback_id =
         string_field(request, &["host_callback_id", "HostCallbackID"]).unwrap_or_default();
     let models = match fetch_models(request, &callback_id) {
-        Ok(models) if !models.is_empty() => models,
+        Ok(discovered) if !discovered.models.is_empty() => {
+            replace_auth_routes(&auth_id, discovered.routes);
+            discovered.models
+        }
         Ok(_) => {
             let error = "上游返回空模型目录";
+            clear_auth_routes(&auth_id);
             host::warn(&callback_id, &auth_id, error);
             fallback_models()
         }
         Err(error) => {
+            clear_auth_routes(&auth_id);
             host::warn(&callback_id, &auth_id, &error);
             fallback_models()
         }
@@ -139,7 +163,34 @@ pub fn models_for_auth(request: &Value) -> Value {
     json!({"Provider": "devin", "Models": models})
 }
 
-fn fetch_models(request: &Value, callback_id: &str) -> Result<Vec<ModelInfo>, String> {
+pub fn route_model(request: &Value) -> Value {
+    let requested_model =
+        string_field(request, &["RequestedModel", "requested_model"]).unwrap_or_default();
+    if !has_devin_prefix(&requested_model) {
+        return json!({"Handled": false});
+    }
+    let requested_effort = request_effort(request);
+    let Some(target_model) = resolve_route(&requested_model, &requested_effort) else {
+        return json!({"Handled": false});
+    };
+    json!({
+        "Handled": true,
+        "TargetKind": "provider",
+        "Target": "devin",
+        "TargetModel": target_model,
+        "Reason": "cpa-devin resolved the discovered model to an upstream chat_model_uid"
+    })
+}
+
+pub fn clear_routes() {
+    if let Some(routes) = ROUTES.get() {
+        if let Ok(mut routes) = routes.write() {
+            routes.clear();
+        }
+    }
+}
+
+fn fetch_models(request: &Value, callback_id: &str) -> Result<DiscoveredModels, String> {
     let credentials = resolve_credentials(request);
     if credentials.api_key.is_empty() {
         return Err("缺少 api_key、session_token 或 token".to_string());
@@ -162,7 +213,10 @@ fn fetch_models(request: &Value, callback_id: &str) -> Result<Vec<ModelInfo>, St
     if raw_models.is_empty() {
         return Err("上游返回空模型目录".to_string());
     }
-    Ok(build_models_from_upstream(raw_models))
+    Ok(DiscoveredModels {
+        models: build_models_from_upstream(&raw_models),
+        routes: build_route_catalog(&raw_models),
+    })
 }
 
 fn resolve_credentials(request: &Value) -> Credentials {
@@ -479,7 +533,7 @@ fn advance(input: &[u8], position: &mut usize, count: usize) -> Result<(), Strin
     Ok(())
 }
 
-fn build_models_from_upstream(raw: Vec<UpstreamModel>) -> Vec<ModelInfo> {
+fn build_models_from_upstream(raw: &[UpstreamModel]) -> Vec<ModelInfo> {
     let mut variants = Vec::new();
     let mut seen = HashSet::new();
     for raw_model in raw {
@@ -531,7 +585,401 @@ fn build_models_from_upstream(raw: Vec<UpstreamModel>) -> Vec<ModelInfo> {
         model.output_token_limit = model.max_completion_tokens;
     }
     upsert_builtin(&mut models);
+    append_exact_models(&mut models, raw);
     models
+}
+
+fn append_exact_models(models: &mut Vec<ModelInfo>, raw: &[UpstreamModel]) {
+    let mut seen = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    let mut seen_upstream = HashSet::new();
+    for raw_model in raw {
+        let uid = raw_model.uid.trim();
+        if uid.is_empty() || !seen_upstream.insert(uid.to_lowercase()) {
+            continue;
+        }
+        let id = format!("devin/{uid}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let mut input_modalities = vec!["text".to_string()];
+        if raw_model.multimodal {
+            input_modalities.push("image".to_string());
+        }
+        let mut model = ModelInfo {
+            id,
+            object: "model".to_string(),
+            owned_by: vendor_name(raw_model.vendor_id, uid).to_string(),
+            model_type: "devin".to_string(),
+            display_name: raw_model.label.trim().to_string(),
+            input_token_limit: raw_model.context_length,
+            output_token_limit: DEFAULT_COMPLETION_TOKENS,
+            supported_generation_methods: vec![
+                "generateContent".to_string(),
+                "countTokens".to_string(),
+            ],
+            context_length: raw_model.context_length,
+            max_completion_tokens: DEFAULT_COMPLETION_TOKENS,
+            supported_input_modalities: input_modalities,
+            supported_output_modalities: vec!["text".to_string()],
+            thinking: None,
+        };
+        normalize_exact_model(&mut model);
+        models.push(model);
+    }
+}
+
+fn normalize_exact_model(model: &mut ModelInfo) {
+    if !model.id.to_lowercase().starts_with("devin/") {
+        model.id = format!("devin/{}", model.id);
+    }
+    if model.object.is_empty() {
+        model.object = "model".to_string();
+    }
+    if model.model_type.is_empty() {
+        model.model_type = "devin".to_string();
+    }
+    if model.supported_input_modalities.is_empty() {
+        model.supported_input_modalities = vec!["text".to_string()];
+    }
+    if model.supported_output_modalities.is_empty() {
+        model.supported_output_modalities = vec!["text".to_string()];
+    }
+    if model.input_token_limit == 0 && model.context_length > 0 {
+        model.input_token_limit = model.context_length;
+    }
+    if model.output_token_limit == 0 && model.max_completion_tokens > 0 {
+        model.output_token_limit = model.max_completion_tokens;
+    }
+    if model.supported_generation_methods.is_empty() {
+        model.supported_generation_methods =
+            vec!["generateContent".to_string(), "countTokens".to_string()];
+    }
+}
+
+fn build_route_catalog(raw: &[UpstreamModel]) -> RouteCatalog {
+    let mut catalog = RouteCatalog::default();
+    for raw_model in raw {
+        let uid = raw_model.uid.trim();
+        if uid.is_empty() {
+            continue;
+        }
+        let clean_uid = uid.to_lowercase();
+        let (mut base_id, effort) = split_model_id(&clean_uid);
+        if base_id.is_empty() {
+            base_id = clean_uid.clone();
+        }
+        let target_model = format!("devin/{uid}");
+        catalog
+            .exact
+            .entry(clean_uid.clone())
+            .or_insert_with(|| target_model.clone());
+        let variants = catalog.by_base.entry(base_id.clone()).or_default();
+        if variants
+            .iter()
+            .any(|variant| variant.target_model.eq_ignore_ascii_case(&target_model))
+        {
+            continue;
+        }
+        variants.push(RouteVariant {
+            target_model,
+            effort,
+            bare: clean_uid == base_id,
+        });
+    }
+    catalog
+}
+
+fn routes() -> &'static RwLock<HashMap<String, RouteCatalog>> {
+    ROUTES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn replace_auth_routes(auth_id: &str, catalog: RouteCatalog) {
+    let auth_id = auth_id.trim();
+    if auth_id.is_empty() {
+        return;
+    }
+    if let Ok(mut routes) = routes().write() {
+        if catalog.by_base.is_empty() {
+            routes.remove(auth_id);
+        } else {
+            routes.insert(auth_id.to_string(), catalog);
+        }
+    }
+}
+
+fn clear_auth_routes(auth_id: &str) {
+    let auth_id = auth_id.trim();
+    if auth_id.is_empty() {
+        return;
+    }
+    if let Some(routes) = ROUTES.get() {
+        if let Ok(mut routes) = routes.write() {
+            routes.remove(auth_id);
+        }
+    }
+}
+
+fn resolve_route(requested_model: &str, requested_effort: &str) -> Option<String> {
+    let routes = ROUTES.get()?.read().ok()?;
+    select_route(routes.values(), requested_model, requested_effort)
+}
+
+fn select_route<'a>(
+    catalogs: impl Iterator<Item = &'a RouteCatalog>,
+    requested_model: &str,
+    requested_effort: &str,
+) -> Option<String> {
+    let clean_model = strip_devin_prefix(requested_model)?.trim();
+    if clean_model.is_empty() {
+        return None;
+    }
+    let exact_key = clean_model.to_lowercase();
+    let catalogs = catalogs.collect::<Vec<_>>();
+
+    let mut exact_targets = BTreeMap::<String, (String, usize)>::new();
+    for catalog in &catalogs {
+        if let Some(target) = catalog.exact.get(&exact_key) {
+            let key = target.to_lowercase();
+            let entry = exact_targets
+                .entry(key)
+                .or_insert_with(|| (target.clone(), 0));
+            entry.1 += 1;
+        }
+    }
+    if let Some(target) = choose_most_supported(exact_targets.into_values()) {
+        return Some(target);
+    }
+
+    let (base_id, suffix_effort) = split_requested_model(clean_model);
+    let base_id = base_id.to_lowercase();
+    let mut choices = BTreeMap::<String, (RouteVariant, usize)>::new();
+    for catalog in &catalogs {
+        let Some(variants) = catalog.by_base.get(&base_id) else {
+            continue;
+        };
+        for variant in variants {
+            let key = variant.target_model.to_lowercase();
+            let entry = choices.entry(key).or_insert_with(|| (variant.clone(), 0));
+            entry.1 += 1;
+        }
+    }
+    if choices.is_empty() {
+        return None;
+    }
+
+    let requested_effort = normalize_effort(if suffix_effort.is_empty() {
+        requested_effort
+    } else {
+        &suffix_effort
+    });
+    let choices = choices.into_values().collect::<Vec<_>>();
+    if !requested_effort.is_empty() {
+        if let Some(target) = choose_variant_with_effort(&choices, &requested_effort) {
+            return Some(target);
+        }
+        if let Some(clamped) = closest_effort(&requested_effort, &choices) {
+            if let Some(target) = choose_variant_with_effort(&choices, &clamped) {
+                return Some(target);
+            }
+        }
+    } else {
+        if let Some(target) = choose_bare_variant(&choices) {
+            return Some(target);
+        }
+        let default_effort = default_route_effort(&base_id, &choices);
+        if !default_effort.is_empty() {
+            if let Some(target) = choose_variant_with_effort(&choices, &default_effort) {
+                return Some(target);
+            }
+        }
+    }
+
+    let empty_effort = choices
+        .iter()
+        .filter(|(variant, _)| variant.effort.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(target) = choose_route_variant(empty_effort.into_iter()) {
+        return Some(target);
+    }
+    choose_route_variant(choices.into_iter())
+}
+
+fn choose_most_supported(values: impl Iterator<Item = (String, usize)>) -> Option<String> {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.to_lowercase().cmp(&right.0.to_lowercase()))
+    });
+    values.into_iter().next().map(|(target, _)| target)
+}
+
+fn choose_route_variant(values: impl Iterator<Item = (RouteVariant, usize)>) -> Option<String> {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right.1.cmp(&left.1).then_with(|| {
+            left.0
+                .target_model
+                .to_lowercase()
+                .cmp(&right.0.target_model.to_lowercase())
+        })
+    });
+    values
+        .into_iter()
+        .next()
+        .map(|(variant, _)| variant.target_model)
+}
+
+fn choose_bare_variant(choices: &[(RouteVariant, usize)]) -> Option<String> {
+    choose_route_variant(choices.iter().filter(|(variant, _)| variant.bare).cloned())
+}
+
+fn choose_variant_with_effort(choices: &[(RouteVariant, usize)], effort: &str) -> Option<String> {
+    choose_route_variant(
+        choices
+            .iter()
+            .filter(|(variant, _)| variant.effort == effort)
+            .cloned(),
+    )
+}
+
+fn closest_effort(requested: &str, choices: &[(RouteVariant, usize)]) -> Option<String> {
+    if requested == "none" {
+        return None;
+    }
+    let requested_rank = effort_rank(requested)?;
+    let mut efforts = choices
+        .iter()
+        .filter_map(|(variant, _)| (!variant.effort.is_empty()).then_some(variant.effort.clone()))
+        .collect::<Vec<_>>();
+    efforts.sort();
+    efforts.dedup();
+    efforts.into_iter().min_by(|left, right| {
+        let left_rank = effort_rank(left).unwrap_or(usize::MAX);
+        let right_rank = effort_rank(right).unwrap_or(usize::MAX);
+        left_rank
+            .abs_diff(requested_rank)
+            .cmp(&right_rank.abs_diff(requested_rank))
+            .then_with(|| right_rank.cmp(&left_rank))
+            .then_with(|| left.cmp(right))
+    })
+}
+
+fn default_route_effort(base_id: &str, choices: &[(RouteVariant, usize)]) -> String {
+    let efforts = choices
+        .iter()
+        .map(|(variant, _)| variant.effort.as_str())
+        .filter(|effort| !effort.is_empty())
+        .collect::<HashSet<_>>();
+    if base_id.contains("swe-2") && efforts.contains("high") {
+        return "high".to_string();
+    }
+    if base_id.starts_with("gpt-5") && efforts.contains("none") && efforts.contains("low") {
+        return "low".to_string();
+    }
+    if efforts.contains("high")
+        && ["gemini", "grok", "glm", "deepseek", "kimi", "nemotron"]
+            .iter()
+            .any(|family| base_id.contains(family))
+    {
+        return "high".to_string();
+    }
+    for effort in ["medium", "high", "low", "minimal", "xhigh", "max", "none"] {
+        if efforts.contains(effort) {
+            return effort.to_string();
+        }
+    }
+    String::new()
+}
+
+fn effort_rank(effort: &str) -> Option<usize> {
+    match effort {
+        "none" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        "fast" => Some(7),
+        _ => None,
+    }
+}
+
+fn split_requested_model(clean_model: &str) -> (String, String) {
+    let trimmed = clean_model.trim();
+    if let Some(without_closing) = trimmed.strip_suffix(')') {
+        if let Some(index) = without_closing.rfind('(') {
+            let effort = normalize_effort(&without_closing[index + 1..]);
+            if !effort.is_empty() {
+                return (without_closing[..index].trim().to_string(), effort);
+            }
+        }
+    }
+    if let Some(index) = trimmed.rfind(':') {
+        let effort = normalize_effort(&trimmed[index + 1..]);
+        if !effort.is_empty() {
+            return (trimmed[..index].trim().to_string(), effort);
+        }
+    }
+    (trimmed.to_string(), String::new())
+}
+
+fn request_effort(request: &Value) -> String {
+    let Some(body) = bytes_field(request, &["Body", "body"]) else {
+        return String::new();
+    };
+    let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+        return String::new();
+    };
+    for value in [
+        body.get("reasoning_effort"),
+        body.get("reasoning").and_then(|value| value.get("effort")),
+        body.get("reasoning").and_then(|value| value.get("level")),
+        body.get("thinking").and_then(|value| value.get("level")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(value) = value.as_str() {
+            let effort = normalize_effort(value);
+            if !effort.is_empty() {
+                return effort;
+            }
+        }
+    }
+    String::new()
+}
+
+fn normalize_effort(value: &str) -> String {
+    match value.trim().to_lowercase().as_str() {
+        "none" | "off" | "disabled" => "none".to_string(),
+        "minimal" => "minimal".to_string(),
+        "low" => "low".to_string(),
+        "medium" => "medium".to_string(),
+        "high" | "auto" | "adaptive" | "thinking" => "high".to_string(),
+        "xhigh" => "xhigh".to_string(),
+        "max" => "max".to_string(),
+        "fast" => "fast".to_string(),
+        _ => String::new(),
+    }
+}
+
+fn has_devin_prefix(model: &str) -> bool {
+    model
+        .trim()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("devin/"))
+}
+
+fn strip_devin_prefix(model: &str) -> Option<&str> {
+    let model = model.trim();
+    has_devin_prefix(model).then(|| &model[6..])
 }
 
 fn aggregate_models(models: Vec<ModelInfo>) -> Vec<ModelInfo> {

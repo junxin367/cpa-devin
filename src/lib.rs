@@ -123,11 +123,20 @@ unsafe extern "C" fn shutdown() {
 
 fn dispatch(method: &str, request: &Value) -> Value {
     match method {
-        "plugin.register" | "plugin.reconfigure" => ok(registration()),
-        "plugin.quiesce" | "plugin.shutdown" => ok(json!({})),
+        "plugin.register" => ok(registration()),
+        "plugin.reconfigure" => {
+            devin::clear_routes();
+            ok(registration())
+        }
+        "plugin.quiesce" => ok(json!({})),
+        "plugin.shutdown" => {
+            devin::clear_routes();
+            ok(json!({}))
+        }
         "executor.identifier" => ok(json!({"identifier": "devin"})),
         "model.static" => ok(json!({"Provider": "devin", "Models": []})),
         "model.for_auth" => ok(devin::models_for_auth(request)),
+        "model.route" => ok(devin::route_model(request)),
         _ => error_envelope("unknown_method", format!("不支持的宿主调用方法：{method}")),
     }
 }
@@ -145,6 +154,7 @@ fn registration() -> Value {
         },
         "capabilities": {
             "model_provider": true,
+            "model_router": true,
             "executor": true,
             "executor_model_scope": "oauth",
             "executor_input_formats": ["openai"],
