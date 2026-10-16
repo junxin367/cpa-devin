@@ -169,6 +169,12 @@ pub fn route_model(request: &Value) -> Value {
     if !has_devin_prefix(&requested_model) {
         return json!({"Handled": false});
     }
+    let clean_model = strip_devin_prefix(&requested_model).unwrap_or_default();
+    let (requested_base, _) = split_requested_model(clean_model);
+    let (canonical_base, _) = split_model_id(&requested_base.to_lowercase());
+    if canonical_base.eq_ignore_ascii_case(clean_model) {
+        return json!({"Handled": false});
+    }
     let requested_effort = request_effort(request);
     let Some(target_model) = resolve_route(&requested_model, &requested_effort) else {
         return json!({"Handled": false});
@@ -1459,6 +1465,32 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_requests_keep_native_accounting_identity() {
+        let auth_id = "canonical-accounting-test";
+        replace_auth_routes(
+            auth_id,
+            build_route_catalog(&[
+                upstream("claude-sonnet-5-5-low"),
+                upstream("claude-sonnet-5-5-medium"),
+                upstream("claude-sonnet-5-5-high"),
+            ]),
+        );
+        for body in [
+            json!({}),
+            json!({"reasoning_effort": "low"}),
+            json!({"reasoning": {"effort": "high"}}),
+            json!({"thinking": {"type": "enabled", "budget_tokens": 8192}}),
+        ] {
+            let result = route_model(&json!({
+                "RequestedModel": "devin/claude-sonnet-5-5",
+                "Body": STANDARD.encode(body.to_string()),
+            }));
+            assert_eq!(result, json!({"Handled": false}), "{body}");
+        }
+        clear_auth_routes(auth_id);
     }
 
     #[test]
