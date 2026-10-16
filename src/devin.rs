@@ -1440,6 +1440,28 @@ mod tests {
     }
 
     #[test]
+    fn bundled_catalog_preserves_anthropic_thinking_models() {
+        let models = fallback_models();
+        for id in [
+            "devin/claude-haiku-5-5",
+            "devin/claude-sonnet-5-5",
+            "devin/claude-opus-5-5",
+        ] {
+            let model = models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("missing bundled model: {id}"));
+            assert_eq!(model.context_length, 1_000_000, "{id}");
+            assert_eq!(model.max_completion_tokens, 64_000, "{id}");
+            assert_eq!(
+                model.thinking.as_ref().expect("thinking levels").levels,
+                ["low", "medium", "high", "xhigh", "max"],
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn discovered_models_only_publish_canonical_names() {
         let raw = vec![
             upstream("claude-sonnet-5-5-low"),
